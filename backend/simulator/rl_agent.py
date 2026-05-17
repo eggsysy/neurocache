@@ -1,98 +1,79 @@
-import time
-import random
 import torch
-from simulator.device import MemorySimulator
-from simulator.predictor import PredictionEngine
-from simulator.rl_agent import RLOptimizer
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import random
+import os
 
-def train_rl_agent_cloud():
-    print("=== STARTING CLOUD-SCALE REINFORCEMENT LEARNING ===")
-    print("Target: 50,000 Episodes | Checkpointing every 5,000 Episodes\n")
-    
-    # 1. Initialize our components
-    app_catalog = ["whatsapp", "maps", "spotify", "chrome", "instagram", "camera", "youtube", "gmail"]
-    predictor = PredictionEngine(app_catalog)
-    rl_agent = RLOptimizer(state_dim=2, action_dim=3)
-    
-    # [ENTERPRISE UPGRADE] Cloud-Scale Parameters
-    EPISODES = 50000
-    BATCH_SIZE = 128
+class DQN(nn.Module):
+    """The Neural Network that evaluates the Q-values for our actions."""
+    def __init__(self, state_dim, action_dim):
+        super(DQN, self).__init__()
+        self.fc1 = nn.Linear(state_dim, 24)
+        self.fc2 = nn.Linear(24, 24)
+        self.fc3 = nn.Linear(24, action_dim)
 
-    start_time = time.time()
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
 
-    for e in range(EPISODES):
-        # Reset the OS environment for the new episode
-        device = MemorySimulator(total_ram_mb=4096)
-        starting_weight = 5000.0
-        device.cache_controller.w_pred = starting_weight
+class RLOptimizer:
+    """The Reinforcement Learning Agent that dynamically tunes the OS memory controller."""
+    def __init__(self, state_dim=2, action_dim=3, lr=0.001, model_path="simulator/rl_weights.pth"):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.memory = []
+        self.gamma = 0.95
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.9998 # Enterprise 50k decay
+        self.model_path = model_path
         
-        # Load up the system to cause pressure
-        apps_to_load = random.sample(app_catalog, 5)
-        for app in apps_to_load:
-            device.allocate(app, random.randint(300, 800), "background_cache")
-            device.active_apps[app]["last_used"] -= random.randint(100, 10000)
+        self.model = DQN(state_dim, action_dim)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.criterion = nn.MSELoss()
 
-        # Generate some predictions
-        recent_history = random.sample(app_catalog, 5)
-        predictions = predictor.get_predictions(recent_history)
-        device.current_predictions = predictions
+        if os.path.exists(self.model_path):
+            self.model.load_state_dict(torch.load(self.model_path, map_location=torch.device('cpu')))
+            self.epsilon = self.epsilon_min
+            print(f"[RL AGENT] Loaded tuned weights from {self.model_path}")
 
-        # Define the RL State: [RAM Utilization %, Thrashing Count]
-        ram_utilization = device.used_ram_mb / device.total_ram_mb
-        state = [ram_utilization, device.metrics['thrashing_events']]
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_dim)
+        state_tensor = torch.FloatTensor(state).unsqueeze(0)
+        with torch.no_grad():
+            act_values = self.model(state_tensor)
+        return torch.argmax(act_values[0]).item()
         
-        total_reward = 0
-        
-        # Simulate 5 distinct memory stress events per episode
-        for time_step in range(5):
-            action = rl_agent.act(state)
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+        if len(self.memory) > 2000:
+            self.memory.pop(0)
+
+    def replay(self, batch_size):
+        if len(self.memory) < batch_size:
+            return
             
-            # 0 = Decrease Weight (-1000), 1 = Hold, 2 = Increase Weight (+1000)
-            if action == 0: device.cache_controller.w_pred = max(0, device.cache_controller.w_pred - 1000)
-            elif action == 2: device.cache_controller.w_pred += 1000
-                
-            current_weight = device.cache_controller.w_pred
-            thrashing_before = device.metrics['thrashing_events']
-
-            # Trigger the stress test
-            try:
-                device.allocate(f"heavy_workload_{time_step}", 1500, "agentic_ai")
-                reward = 10 
-            except Exception:
-                reward = -100 
-
-            # Calculate penalties
-            thrashing_after = device.metrics['thrashing_events']
-            if thrashing_after > thrashing_before:
-                reward -= 50 
-
-            # Observe new state
-            next_ram_utilization = device.used_ram_mb / device.total_ram_mb
-            next_state = [next_ram_utilization, thrashing_after]
+        minibatch = random.sample(self.memory, batch_size)
+        for state, action, reward, next_state, done in minibatch:
+            target = reward
+            if not done:
+                next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0)
+                target = (reward + self.gamma * torch.max(self.model(next_state_tensor)[0]).item())
             
-            # Store experience
-            done = time_step == 4
-            rl_agent.remember(state, action, reward, next_state, done)
-            state = next_state
-            total_reward += reward
+            state_tensor = torch.FloatTensor(state).unsqueeze(0)
+            target_f = self.model(state_tensor)
+            target_f[0][action] = target
+            
+            self.optimizer.zero_grad()
+            loss = self.criterion(self.model(state_tensor), target_f)
+            loss.backward()
+            self.optimizer.step()
+            
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
 
-        # Replay and Learn
-        rl_agent.replay(BATCH_SIZE)
-        
-        # [ENTERPRISE UPGRADE] Sparse Logging for AWS CloudWatch
-        if (e + 1) % 500 == 0:
-            elapsed = (time.time() - start_time) / 60
-            print(f"Ep: {e+1:05d}/{EPISODES} | Reward: {total_reward:4d} | W: {current_weight} | Eps: {rl_agent.epsilon:.3f} | Time: {elapsed:.1f}m")
-
-        # [ENTERPRISE UPGRADE] Cloud Checkpointing
-        if (e + 1) % 5000 == 0:
-            ckpt_path = f'simulator/rl_weights_ckpt_{e+1}.pth'
-            torch.save(rl_agent.model.state_dict(), ckpt_path)
-            print(f">>> [CHECKPOINT] Brain state securely backed up to {ckpt_path}")
-
-    # Final Save
-    rl_agent.save()
-    print("\n[SUCCESS] 50k Epoch Cloud Training Complete. Gold weights saved to 'rl_weights.pth'")
-
-if __name__ == "__main__":
-    train_rl_agent_cloud()
+    def save(self):
+        torch.save(self.model.state_dict(), self.model_path)
