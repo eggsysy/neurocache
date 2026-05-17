@@ -35,6 +35,9 @@ class SmartCacheController:
             # Get the ML prediction for this app (default to 0% if no prediction exists)
             prob = current_predictions.get(app_id, 0.0) 
             
+            # Calculate time_idle here so we can print it
+            time_idle = current_time - app_data["last_used"]
+            
             score = self.calculate_eviction_score(app_data, current_time, prob)
             
             print(f"  [P-LRU] App: {app_id} | Idle: {time_idle:.1f}s | Prob: {prob*100}% | Score: {score:.1f}")
